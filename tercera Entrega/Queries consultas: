@@ -1,0 +1,207 @@
+1. 
+SELECT 
+    p.id_mapa,
+    m.Nombre AS nombre_mapa,
+    AVG(p.Hora_fin - p.Hora_inicio) AS duracion_promedio
+FROM Partida p
+JOIN Mapa m ON m.id_mapa = p.id_mapa
+GROUP BY 
+    p.id_mapa, 
+    m.Nombre
+ORDER BY 
+    p.id_mapa;
+
+3. 
+WITH trayectorias AS (
+    SELECT 
+        p.id_jugador,
+        t1.id_partida,
+        SQRT(
+            POWER(t2.pos_x - t1.pos_x, 2) +
+            POWER(t2.pos_y - t1.pos_y, 2) +
+            POWER(t2.pos_z - t1.pos_z, 2)
+        ) AS dist
+    FROM Telemetria t1
+    JOIN Telemetria t2 
+        ON t1.id_partida = t2.id_partida
+       AND t2.tiempo = (
+            SELECT MIN(t3.tiempo)
+            FROM Telemetria t3
+            WHERE t3.id_partida = t1.id_partida
+              AND t3.tiempo > t1.tiempo
+       )
+    JOIN Partida p 
+        ON p.id_partida = t1.id_partida
+)
+SELECT 
+    id_jugador,
+    CAST(SUM(dist) AS DECIMAL(10, 2)) AS trayecto_total,
+    CAST(MIN(dist) AS DECIMAL(10, 2)) AS tramo_minimo,
+    CAST(MAX(dist) AS DECIMAL(10, 2)) AS tramo_maximo
+FROM trayectorias
+GROUP BY 
+    id_jugador;
+
+4.
+WITH promedio AS (
+    SELECT 
+        AVG(EXTRACT(EPOCH FROM (hora_fin - hora_inicio))) AS duracion_promedio
+    FROM Partida
+)
+SELECT 
+    u.id_usuario,
+    u.nombre_usuario,
+    r.id_pregunta,
+    r.calificacion
+FROM Partida p
+JOIN Jugador j ON j.id_jugador = p.id_jugador
+JOIN Usuario u ON u.id_usuario = j.id_usuario
+JOIN Responde r ON r.id_usuario = u.id_usuario
+WHERE EXTRACT(EPOCH FROM (p.hora_fin - p.hora_inicio)) >
+      (SELECT duracion_promedio FROM promedio)
+ORDER BY 
+    u.id_usuario, 
+    r.id_pregunta;
+
+5.
+WITH conteo AS (
+    SELECT 
+        e.id_episodio,
+        m.id_mapa,
+        (t.pos_x / 250) AS sector_x,
+        (t.pos_y / 250) AS sector_y,
+        COUNT(*) AS visitas
+    FROM Telemetria t
+    JOIN Partida p ON p.id_partida = t.id_partida
+    JOIN Mapa m ON m.id_mapa = p.id_mapa
+    JOIN Episodio e ON e.id_episodio = m.id_episodio
+    GROUP BY 
+        e.id_episodio, 
+        m.id_mapa,
+        sector_x,
+        sector_y
+),
+ranking AS (
+    SELECT 
+        *,
+        ROW_NUMBER() OVER (
+            PARTITION BY id_mapa 
+            ORDER BY visitas DESC
+        ) AS rn
+    FROM conteo
+)
+SELECT 
+    id_episodio,
+    id_mapa,
+    sector_x,
+    sector_y,
+    visitas
+FROM ranking
+ORDER BY 
+    id_mapa, 
+    visitas DESC;
+
+7.
+WITH siguiente AS (
+    SELECT t1.*, (
+        SELECT t2.tiempo
+        FROM Telemetria t2
+        WHERE t2.id_partida = t1.id_partida
+          AND t2.tiempo > t1.tiempo
+        ORDER BY t2.tiempo
+        LIMIT 1
+    ) AS tiempo_sig
+    FROM Telemetria t1
+),
+distancias AS (
+    SELECT
+        e.id_episodio, p.id_jugador,
+        SQRT(
+            POWER(t2.pos_x - t1.pos_x, 2) +
+            POWER(t2.pos_y - t1.pos_y, 2) +
+            POWER(t2.pos_z - t1.pos_z, 2)
+        ) AS dist
+    FROM siguiente t1
+    JOIN Telemetria t2 
+        ON t2.id_partida = t1.id_partida 
+       AND t2.tiempo = t1.tiempo_sig
+    JOIN Partida p ON p.id_partida = t1.id_partida
+    JOIN Mapa m   ON m.id_mapa = p.id_mapa
+    JOIN Episodio e ON e.id_episodio = m.id_episodio
+),
+minimos AS (
+    SELECT id_episodio, id_jugador, SUM(dist) AS total_dist
+    FROM distancias
+    GROUP BY id_episodio, id_jugador
+),
+ganadores AS (
+    SELECT m1.id_episodio, m1.id_jugador
+    FROM minimos m1
+    WHERE m1.total_dist = (
+        SELECT MIN(m2.total_dist)
+        FROM minimos m2 
+        WHERE m2.id_episodio = m1.id_episodio
+    )
+)
+SELECT 
+    g.id_episodio, u.id_usuario, u.nombre_usuario, AVG(r.calificacion) AS promedio_calificacion
+FROM ganadores g
+JOIN Jugador j ON j.id_jugador = g.id_jugador
+JOIN Usuario u ON u.id_usuario = j.id_usuario
+JOIN Responde r ON r.id_usuario = u.id_usuario
+GROUP BY g.id_episodio, u.id_usuario, u.nombre_usuario
+ORDER BY g.id_episodio, u.id_usuario;
+
+--Indexes
+--Indice 1,para consulta 5
+CREATE INDEX idx_partida_id_mapa ON Partida (id_mapa);
+
+--Indice 2,para consulta 4
+CREATE INDEX idx_partida_id_jugador ON Partida (id_jugador);
+
+--Indice 3,para consulta 3
+CREATE INDEX idx_telemetria_posicion ON Telemetria (id_partida, pos_x, pos_y, pos_z);
+
+--Views
+
+--Vista 1
+CREATE VIEW vw_duracion_promedio_mapa AS
+SELECT
+    p.id_mapa,
+    m.Nombre AS nombre_mapa,
+    AVG(EXTRACT(EPOCH FROM (p.Hora_fin - p.Hora_inicio))) AS duracion_promedio_seg
+FROM Partida p
+JOIN Mapa m ON m.id_mapa = p.id_mapa
+GROUP BY p.id_mapa, m.Nombre;
+
+--Vista 2
+CREATE VIEW VistaPartidasJugador AS
+SELECT 
+    u.id_usuario,
+    u.nombre_usuario,
+    j.id_jugador,
+    j.nombre AS nombre_jugador,
+    e.nombre AS episodio,
+    m.nombre AS mapa,
+    p.id_partida,
+    p.hora_inicio,
+    p.hora_fin
+FROM Partida p
+JOIN Jugador j ON p.id_jugador = j.id_jugador
+JOIN Usuario u ON j.id_usuario = u.id_usuario
+JOIN Mapa m ON p.id_mapa = m.id_mapa
+JOIN Episodio e ON m.id_episodio = e.id_episodio;
+
+--Materialized View
+CREATE MATERIALIZED VIEW MV_PromedioUXPorUsuario AS
+SELECT 
+    u.id_usuario,
+    u.nombre_usuario,
+    COUNT(r.calificacion) AS total_respuestas,
+    AVG(r.calificacion)   AS promedio_calificacion
+FROM Usuario u
+LEFT JOIN Responde r ON u.id_usuario = r.id_usuario
+GROUP BY u.id_usuario, u.nombre_usuario;
+
+
+
